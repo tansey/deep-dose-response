@@ -116,14 +116,95 @@ def beta_mcmc(ebo, drug_idx,
 
     return indices, Beta_samples, Sigma_samples, Loglikelihood_samples
 
-
-if __name__ == '__main__':
+def diagnostics(args, dargs, ebo):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pylab as plt
-    import argparse
-    import os
 
+    # Get the index of the target drug
+    drug_idx = args.drug
+
+    # Save all samples including burn-in and thinning
+    nsampels, nthin, nburn = args.nsamples, args.nthin, args.nburn
+    args.nsamples = args.nsamples * args.nthin + args.nburn
+    args.nburn = 0
+    args.nthin = 1
+
+    # Filter down the drugs to a few randomly chosen subsets
+    indices = np.random.choice(np.arange(ebo.Y.shape[0])[np.any(ebo.obs_mask[:,drug_idx].astype(bool), axis=1)], size=args.ndiag, replace=False)
+    mask = np.zeros(ebo.obs_mask.shape)
+    mask[indices,drug_idx] = ebo.obs_mask[indices,drug_idx]
+    ebo.obs_mask = mask
+
+    
+    # Fit the posterior via MCMC
+    indices, Beta, Sigma, loglike = beta_mcmc(ebo, drug_idx, **dargs)
+
+    # Get all the different survival rates
+    Tau = ilogit(Beta)
+
+    # Simple trace plot
+    import seaborn as sns
+    with sns.axes_style('white', {'legend.frameon': True}):
+        plt.rc('font', weight='bold')
+        plt.rc('grid', lw=3)
+        plt.rc('lines', lw=1)
+        matplotlib.rcParams['pdf.fonttype'] = 42
+        matplotlib.rcParams['ps.fonttype'] = 42
+        plt.plot(Tau[:,:args.ntrace,0].reshape((Tau.shape[0], -1)))
+        plt.xlabel('MCMC iteration', fontsize=18)
+        plt.ylabel('Dose-response values ($\\tau$)', fontsize=18)
+        plt.savefig(f'{args.plot_path}/trace-{args.drug}.pdf', bbox_inches='tight')
+        plt.close()
+
+    # Filter Tau using the burn-in and thinning settings
+    Tau = Tau[nburn:]
+    Tau = Tau[::nthin]
+
+    # Coverage stats
+    credible_intervals = np.array([.50, .75, .85, .90, .95, .99])
+
+    # Get the offsets and grids
+    Y = ebo.Y[indices, drug_idx]
+    C = ebo.C[indices, drug_idx]
+    lams = gamma.rvs(ebo.A[indices, drug_idx], scale=ebo.B[indices, drug_idx], size=(100,Tau.shape[0]) + ebo.A[indices, drug_idx].shape)
+    print(Y.shape, C.shape, lams.shape, Tau.shape)
+    # Calculate the upper and lower credible interval bands via MC
+    Y_samples = poisson.rvs(C[None, None, :, None] + lams[...,None]*Tau[None]).reshape((-1,) + Tau.shape[-2:])
+    Y_upper = np.zeros((len(credible_intervals),) + Y.shape)
+    Y_lower = np.zeros((len(credible_intervals),) + Y.shape)
+    print('Y samples', Y_samples.shape, 'Y_upper', Y_upper.shape)
+    for ci_idx, interval in enumerate(credible_intervals):
+        Y_upper[ci_idx] = np.percentile(Y_samples, 100 - (1 - interval)/2*100, axis=0)
+        Y_lower[ci_idx] = np.percentile(Y_samples, (1 - interval)/2*100, axis=0)
+
+    # Check for coverage rates
+    coverage = np.array([np.nanmean((Y_lower[i] <= Y) & (Y_upper[i] >= Y)) for i in range(len(credible_intervals))])
+    print(coverage)
+
+    import seaborn as sns
+    with sns.axes_style('white', {'legend.frameon': True}):
+        plt.rc('font', weight='bold')
+        plt.rc('grid', lw=3)
+        plt.rc('lines', lw=3)
+        matplotlib.rcParams['pdf.fonttype'] = 42
+        matplotlib.rcParams['ps.fonttype'] = 42
+        plt.plot(credible_intervals*100, coverage*100, color='blue')
+        plt.plot(credible_intervals*100, credible_intervals*100, color='black')
+        plt.xlabel('Posterior credible interval', fontsize=18)
+        plt.ylabel('Coverage', fontsize=18)
+        plt.savefig(f'{args.plot_path}/coverage-{args.drug}.pdf', bbox_inches='tight')
+        plt.close()
+
+    
+
+
+def run():
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pylab as plt
+    import os
+    import argparse
     parser = argparse.ArgumentParser(description='Estimate the dose-response covariance matrix on a per-drug basis.')
 
     # Experiment settings
@@ -141,6 +222,9 @@ if __name__ == '__main__':
     parser.add_argument('--nburn', type=int, default=500, help='Number of MCMC burn-in steps.')
     parser.add_argument('--nsamples', type=int, default=1500, help='Number of MCMC steps to use.')
     parser.add_argument('--nthin', type=int, default=1, help='Number of MCMC steps between sample steps.')
+    parser.add_argument('--diagnostic', action='store_true', default=False, help='Run a diagnostic setup to check convergence.')
+    parser.add_argument('--ntrace', type=int, default=5, help='Run a diagnostic setup to check convergence.')
+    parser.add_argument('--ndiag', type=int, default=30, help='Run a diagnostic setup to check convergence.')
     
     # Get the arguments from the command line
     args = parser.parse_args()
@@ -148,8 +232,8 @@ if __name__ == '__main__':
 
     # Seed the random number generators so we get reproducible results
     np.random.seed(args.seed)
-    
-    print('Running step 5 with args:')
+
+    print('Running posterior sampler with args:')
     print(args)
     print('Working on project: {}'.format(args.name))
 
@@ -162,10 +246,14 @@ if __name__ == '__main__':
     ebo = create_predictive_model(model_save_path, **dargs)
     ebo.load()
 
-    # Fit the posterior on  via MCMC
+    # Generate MCMC diagnostics instead of saving results
+    if args.diagnostic:
+        diagnostics(args, dargs, ebo)
+        return
+
+    # Fit the posterior via MCMC
     drug_idx = args.drug
     indices, Beta, Sigma, loglike = beta_mcmc(ebo, drug_idx, **dargs)
-
 
     # Calculate the posterior AUC scores
     Tau = ilogit(Beta)
@@ -254,7 +342,8 @@ if __name__ == '__main__':
         plt.close()
     
 
-
+if __name__ == '__main__':
+    run()
 
 
 
